@@ -33,7 +33,9 @@ scripts/deploy
 !README.md
 
 # Deploy scaffolding (built inside compose/CI, not shipped in image)
-deploy
+#   .ffmpeg/ 만 예외다 — build.sh 가 받아둔 static 바이너리를 이미지에 넣어야 한다.
+deploy/*
+!deploy/.ffmpeg
 
 # IDE / OS noise
 .idea

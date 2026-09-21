@@ -46,3 +46,6 @@ verification/runs/
 .omc/
 .omx/
 .claude/
+
+# build.sh 가 받아두는 ffmpeg static 바이너리 (커밋하지 않는다)
+deploy/.ffmpeg/

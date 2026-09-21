@@ -22,7 +22,22 @@ import threading
 from contextlib import closing
 from pathlib import Path
 
+#: 현재 코드가 기대하는 스키마 버전. 스키마를 바꿀 때마다 1씩 올린다.
 SCHEMA_VERSION = 1
+
+#: 버전 N 키에는 "N-1 에서 N 으로 올리는" SQL 을 순서대로 넣는다.
+#: 새 컬럼은 여기에 ALTER TABLE 로 추가하고, _SCHEMA 의 CREATE TABLE 에도
+#: 같이 적어야 한다 (빈 DB 는 CREATE 로, 기존 DB 는 ALTER 로 같은 모양이 된다).
+#:
+#: 예시 — uploaded_by 컬럼을 추가하며 버전 2 로 올리는 경우:
+#:     SCHEMA_VERSION = 2
+#:     _MIGRATIONS = {
+#:         2: ("ALTER TABLE merge_jobs ADD COLUMN uploaded_by TEXT",),
+#:     }
+#:
+#: 새 테이블이나 인덱스는 _SCHEMA 에 CREATE ... IF NOT EXISTS 로 적으면
+#: 여기 등록하지 않아도 기존 DB 에 자동으로 생긴다.
+_MIGRATIONS: dict[int, tuple[str, ...]] = {}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS merge_jobs (
@@ -111,12 +126,83 @@ class MergeRecordStore:
         return connection
 
     def _initialize(self) -> None:
+        """Create the schema on a fresh file, or migrate an existing one.
+
+        `CREATE TABLE IF NOT EXISTS` alone is not enough: on an existing
+        database it silently does nothing, so a column added in a later
+        version would never appear and every write touching it would fail
+        with "no such column". The stored version tells us which ALTERs
+        still have to run.
+        """
         with self._write_lock, closing(self._connect()) as connection, connection:
-            connection.executescript(_SCHEMA)
-            connection.execute(
-                "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', ?)",
-                (str(SCHEMA_VERSION),),
+            fresh = (
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='merge_jobs'"
+                ).fetchone()
+                is None
             )
+
+            # New tables and indexes land here on any database; columns don't.
+            connection.executescript(_SCHEMA)
+
+            if fresh:
+                # Nothing to migrate: CREATE TABLE already produced the latest shape.
+                self._write_version(connection, SCHEMA_VERSION)
+                return
+
+            self._migrate(connection, self._read_version(connection))
+
+    @staticmethod
+    def _read_version(connection: sqlite3.Connection) -> int:
+        """Schema version recorded in the file. Pre-versioning files count as 1."""
+        row = connection.execute(
+            "SELECT value FROM schema_meta WHERE key = 'version'"
+        ).fetchone()
+        if row is None:
+            return 1
+        try:
+            return int(row[0])
+        except (TypeError, ValueError):
+            print(f"WARN merge_schema_version_unreadable value={row[0]!r} assuming=1", flush=True)
+            return 1
+
+    @staticmethod
+    def _write_version(connection: sqlite3.Connection, version: int) -> None:
+        connection.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', ?)",
+            (str(version),),
+        )
+
+    def _migrate(self, connection: sqlite3.Connection, current: int) -> None:
+        if current == SCHEMA_VERSION:
+            return
+
+        if current > SCHEMA_VERSION:
+            # Older image on a database a newer one already migrated. Migrations
+            # only ever add things, so the extra columns are harmless here --
+            # this is what makes rolling back to a previous tag work. The version
+            # is left alone so the newer image does not re-run its migrations.
+            print(
+                f"WARN merge_schema_newer_than_code db={current} code={SCHEMA_VERSION} "
+                "continuing (extra columns are ignored)",
+                flush=True,
+            )
+            return
+
+        # One step at a time, each committed with its own version bump, so an
+        # interrupted upgrade resumes from where it stopped instead of redoing
+        # statements that already applied.
+        for target in range(current + 1, SCHEMA_VERSION + 1):
+            for statement in _MIGRATIONS.get(target, ()):
+                try:
+                    connection.execute(statement)
+                except sqlite3.OperationalError as exc:
+                    raise sqlite3.OperationalError(
+                        f"merge.db migration to v{target} failed on: {statement} ({exc})"
+                    ) from exc
+            self._write_version(connection, target)
+            connection.commit()
+            print(f"INFO merge_schema_migrated from={target - 1} to={target}", flush=True)
 
     # ------------------------------------------------------------------ write
 
